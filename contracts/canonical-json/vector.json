@@ -1,0 +1,163 @@
+{
+  "contract": "canonical-json",
+  "version": 1,
+  "description": "Frozen cases for the canonical JSON encoding and its SHA-256 content id. An implementation is conformant when it reproduces `canonical` and `content_id` for every case.",
+  "rules": [
+    "Object keys are sorted ascending by UTF-16 code unit; input order is irrelevant.",
+    "Array order is significant and preserved.",
+    "No insignificant whitespace: the separators are exactly ',' and ':'.",
+    "Output is UTF-8; non-ASCII characters are emitted literally, never \\u-escaped.",
+    "Control characters and quotes use the shortest JSON escape.",
+    "Non-finite numbers (NaN, Infinity) have no canonical form and must be refused.",
+    "content_id is 'sha256:' followed by the lowercase hex SHA-256 of the canonical UTF-8 bytes."
+  ],
+  "out_of_contract": {
+    "floating_point": "Whether a non-integer number is accepted is deliberately NOT frozen, and no case below contains one. laicode refuses floats outright to avoid representation ambiguity; ai-cohort accepts finite ones. Both remain conformant, because this contract covers only what they already agree on. Freezing a float rule would change a published artifact in one project or the other, which is an ADR rather than a vector edit."
+  },
+  "cases": [
+    {
+      "name": "empty-object",
+      "value": {},
+      "canonical": "{}",
+      "content_id": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "name": "empty-array",
+      "value": [],
+      "canonical": "[]",
+      "content_id": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "name": "null",
+      "value": null,
+      "canonical": "null",
+      "content_id": "sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+    },
+    {
+      "name": "booleans",
+      "value": [
+        true,
+        false
+      ],
+      "canonical": "[true,false]",
+      "content_id": "sha256:153c9dbcc7025ecd7e50ce6d83f1995233dfc636bc869098e3a8d84288fd938a"
+    },
+    {
+      "name": "integers",
+      "value": {
+        "zero": 0,
+        "positive": 1234567890,
+        "negative": -42
+      },
+      "canonical": "{\"negative\":-42,\"positive\":1234567890,\"zero\":0}",
+      "content_id": "sha256:d4d709d81a3af13f0c1c860e8e64119b016f30111c2b91d6d82d9127e2e1f59f"
+    },
+    {
+      "name": "key-order-is-not-input-order",
+      "value": {
+        "2": 6,
+        "10": 5,
+        "z": 1,
+        "a": 2,
+        "M": 3,
+        "b": 4
+      },
+      "canonical": "{\"10\":5,\"2\":6,\"M\":3,\"a\":2,\"b\":4,\"z\":1}",
+      "content_id": "sha256:0889e04850c718f9efe5bee936fb6e0baa0dca30302c35c3f494e5e29b37b563"
+    },
+    {
+      "name": "nested",
+      "value": {
+        "a": {
+          "empty": {},
+          "nested": [
+            1,
+            2,
+            {
+              "k": "v"
+            }
+          ]
+        },
+        "z": [
+          [],
+          [
+            []
+          ]
+        ]
+      },
+      "canonical": "{\"a\":{\"empty\":{},\"nested\":[1,2,{\"k\":\"v\"}]},\"z\":[[],[[]]]}",
+      "content_id": "sha256:fdadc7ed436ec51c7d1fedd8acd9817a1884de652ecac8c8e5118d5a5df02d46"
+    },
+    {
+      "name": "unicode-values",
+      "value": {
+        "text": "café — naïve",
+        "emoji": "🐊",
+        "cjk": "協調"
+      },
+      "canonical": "{\"cjk\":\"協調\",\"emoji\":\"🐊\",\"text\":\"café — naïve\"}",
+      "content_id": "sha256:11eb29e75399861e0a493e882a07d18ea4028ebb3d449af0b4af98ae5d21b767"
+    },
+    {
+      "name": "unicode-keys",
+      "value": {
+        "é": 1,
+        "z": 2,
+        "🐊": 3
+      },
+      "canonical": "{\"z\":2,\"é\":1,\"🐊\":3}",
+      "content_id": "sha256:f8b1a5edcd3f145392bce4c50be1ee18e0dadde25ea8de46804d5ef68f6b59b1"
+    },
+    {
+      "name": "string-escapes",
+      "value": {
+        "s": "tab\there \"quoted\" back\\slash\nnewline"
+      },
+      "canonical": "{\"s\":\"tab\\there \\\"quoted\\\" back\\\\slash\\nnewline\"}",
+      "content_id": "sha256:bd2c214a1635d40ad2769d189fa5a05751c84dfabc01e6af212f39a09b72b81e"
+    },
+    {
+      "name": "control-characters",
+      "value": {
+        "s": "\u0001\u001f"
+      },
+      "canonical": "{\"s\":\"\\u0001\\u001f\"}",
+      "content_id": "sha256:38dc5e0128fedab8edba6b02f7f09663f16bfe0f1afb41a5774a29154732a6e0"
+    },
+    {
+      "name": "array-preserves-order",
+      "value": [
+        3,
+        1,
+        2,
+        {
+          "b": 1,
+          "a": 2
+        }
+      ],
+      "canonical": "[3,1,2,{\"a\":2,\"b\":1}]",
+      "content_id": "sha256:5e21d54df1a71703f6f25216ff0c5dbd78bca73255f936a50c0128cb5e801c5b"
+    },
+    {
+      "name": "deeply-nested",
+      "value": {
+        "a": {
+          "b": {
+            "c": {
+              "d": {
+                "e": [
+                  1,
+                  {
+                    "f": null
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "canonical": "{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":[1,{\"f\":null}]}}}}}",
+      "content_id": "sha256:10c8d3927d85bc56d5adda94e7de8770df6151cc5af369ac3c7bf98e2ad872d5"
+    }
+  ]
+}

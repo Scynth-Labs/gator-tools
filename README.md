@@ -7,6 +7,7 @@ copied. One clone, one version, one place to fix a bug.
 | --- | --- |
 | [`skills/multi-agent-coordination`](skills/multi-agent-coordination/SKILL.md) | Coordinate several coding agents over one repository: joins, presence leases, exclusive file claims, named-reviewer quorums, blocking design questions, handoffs, and commit-pinned merge gates. Local Git backend by default; Redis Streams when agents are on different machines. |
 | [`scripts/check-syntax.mjs`](scripts/check-syntax.mjs) | Parse every JavaScript file under the given roots and fail on the first syntax error. A gate, not a linter. |
+| [`contracts/canonical-json`](contracts/canonical-json/CONTRACT.md) | One byte representation for a JSON value and one SHA-256 content id, frozen as a vector so implementations in different languages cannot drift apart. Reference implementations in JavaScript and Python, plus verifiers for checking your own. |
 
 ## Installing in a project
 
@@ -51,6 +52,26 @@ that path so an agent finds it without being told each session.
 
 State lives under the consuming repository's `.git/multi-agent-coordination/`,
 never here. Nothing in this repository is written to at runtime.
+
+## Contracts
+
+A contract is a frozen vector plus the rules describing it. It exists when more
+than one implementation has to agree — across languages, across repositories, or
+across time — and prose alone would let them drift.
+
+`canonical-json` is the first. ai-cohort and laicode each wrote a canonical JSON
+encoder independently, in different languages, and they agree byte for byte on
+every case in the vector. Nothing checked that until now. Both verify against it
+in CI, so the agreement is a guarantee rather than a coincidence.
+
+```sh
+node contracts/canonical-json/verify.mjs path/to/module.mjs --canonical canonicalize
+python3 contracts/canonical-json/verify.py your.module --canonical canonical_json_bytes
+```
+
+Read [CONTRACT.md](contracts/canonical-json/CONTRACT.md) before changing a
+vector. Regenerating one is easy, which is the risk: it will bless whatever the
+implementation currently does.
 
 ## Scope
 

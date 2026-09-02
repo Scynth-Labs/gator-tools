@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax gate
+        run: node scripts/check-syntax.mjs skills scripts contracts
+
+      - name: Coordination skill
+        run: node --test skills/multi-agent-coordination/scripts/coord.test.mjs
+
+      # Both reference implementations must reproduce the frozen vector. If this
+      # fails, either an implementation drifted or the vector was regenerated
+      # without anyone reading the diff.
+      - name: canonical-json — JavaScript reference
+        run: node contracts/canonical-json/verify.mjs contracts/canonical-json/canonical.mjs
+      - name: canonical-json — Python reference
+        run: python3 contracts/canonical-json/verify.py contracts/canonical-json/canonical.py
+
+      - name: The vector is frozen, not regenerated in place
+        run: |
+          node contracts/canonical-json/build-vector.mjs
+          git diff --exit-code contracts/canonical-json/vector.json
