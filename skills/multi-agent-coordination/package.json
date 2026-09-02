@@ -1,0 +1,14 @@
+{
+  "name": "multi-agent-coordination-skill-tools",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test scripts/coord.test.mjs"
+  },
+  "dependencies": {
+    "redis": "^6.2.1"
+  }
+}
