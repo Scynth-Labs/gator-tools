@@ -73,6 +73,29 @@ Read [CONTRACT.md](contracts/canonical-json/CONTRACT.md) before changing a
 vector. Regenerating one is easy, which is the risk: it will bless whatever the
 implementation currently does.
 
+## How this is tested
+
+Three tiers, each catching what the others cannot.
+
+| | When | What only it finds |
+| --- | --- | --- |
+| **CI** | every push | Does it work as written, on Node 20 and 24 and Python 3.11 and 3.13. Parse gate, coordination state machine, both canonical-json references against the vector, and proof the vector was not regenerated in place. |
+| **Nightly** | daily | The Redis backend against a live server, which every pull request skips. Cross-language fuzzing of canonical-json over 50,000 generated documents on a rotating seed. Sixteen real processes contending for one claim. |
+| **Weekly** | Mondays | Each consuming project, cloned and run against this repository's HEAD. A submodule pins a commit, so a consumer keeps passing on its old pin right up until someone updates it — this is that update, done early. |
+
+Run any of them locally:
+
+```sh
+node scripts/check-syntax.mjs skills scripts contracts tests
+node --test skills/multi-agent-coordination/scripts/coord.test.mjs
+node --test tests/known-divergences.mjs
+node tests/differential-canonical.mjs --count 50000 --seed 1
+node tests/concurrency-stress.mjs --agents 16 --rounds 5
+```
+
+The differential test prints the seed on failure, and the seed reproduces the
+exact document that disagreed.
+
 ## Scope
 
 Something belongs here when it is useful to more than one repository and carries

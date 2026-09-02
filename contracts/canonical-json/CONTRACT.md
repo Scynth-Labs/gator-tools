@@ -35,6 +35,30 @@ bytes being attested.
 
 ## What is deliberately not frozen
 
+**Astral-plane object keys — a live divergence, not a preference.** Rule 1 says
+UTF-16 code unit order, which is what RFC 8785 (JSON Canonicalization Scheme)
+mandates and what JavaScript's `sort` does. Python's `sort_keys=True` sorts by
+codepoint instead. The two agree for every key below U+10000 and disagree above
+it, because U+1D11E is the single code unit sequence `D834 DD1E` in UTF-16 —
+whose first unit is below U+FEFF — but the codepoint `0x1D11E`, which is above
+it:
+
+```
+input   {"\uFEFF": 1, "\U0001D11E": 2}
+JS      {"𝄞":2,"\uFEFF":1}
+Python  {"\uFEFF":1,"𝄞":2}
+```
+
+Different bytes, therefore a different SHA-256, with no error raised on either
+side. An object carrying both an astral-plane key and a BMP key at or above
+U+E000 will not round-trip between the two.
+
+No vector case contains an astral key, and `tests/known-divergences.mjs` asserts
+the disagreement still exists, so closing it has to be deliberate. Closing it
+properly means making the Python side sort by UTF-16 code unit — which changes
+content ids for such documents and is therefore an ADR in each consuming
+project, not a vector edit.
+
 **Floating-point numbers.** No case in the vector contains one, and whether an
 implementation accepts them is left open.
 

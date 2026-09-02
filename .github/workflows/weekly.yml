@@ -1,0 +1,105 @@
+name: Weekly
+
+# Does the tip of this repository still work inside the projects that vendor it?
+#
+# CI proves the tools are correct in isolation and nightly proves they hold
+# under load. Neither notices that a change here broke a consumer, because a
+# submodule pins a commit: a project keeps passing on the old pin right up until
+# someone updates it, and then it breaks with no obvious cause. This runs each
+# consumer against this repository's HEAD, which is the update they would do.
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  consumers:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: ShubhendraGautam/ai-cohort
+            setup: npm install --ignore-scripts
+            test: node --test test/canonical-contract.test.js
+          - repo: ShubhendraGautam/laicode
+            setup: "true"
+            test: python3 -m unittest tests.test_canonical_contract -v
+          - repo: ShubhendraGautam/xplanyexez
+            setup: "true"
+            test: "true"
+          - repo: ShubhendraGautam/atomiX
+            setup: "true"
+            test: "true"
+    steps:
+      - name: Check out gator-tools at HEAD
+        uses: actions/checkout@v4
+        with:
+          path: gator-tools-head
+
+      - name: Check out the consumer
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          path: consumer
+          submodules: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Point the consumer's submodule at this HEAD
+        working-directory: consumer
+        run: |
+          if [ ! -d gator-tools ]; then
+            echo "::notice::${{ matrix.repo }} does not vendor gator-tools yet; nothing to verify"
+            exit 0
+          fi
+          rm -rf gator-tools
+          cp -r ../gator-tools-head gator-tools
+          rm -rf gator-tools/.git
+
+      - name: The skill still runs from where the consumer mounts it
+        working-directory: consumer
+        run: |
+          [ -d gator-tools ] || exit 0
+          node gator-tools/skills/multi-agent-coordination/scripts/coord.mjs > /dev/null
+
+      - name: The consumer's own suite, against this HEAD
+        working-directory: consumer
+        run: |
+          [ -d gator-tools ] || exit 0
+          ${{ matrix.setup }}
+          ${{ matrix.test }}
+
+  integrity:
+    # Slow-moving rot that no single change causes: a vector whose digests stop
+    # matching its own canonical strings would invalidate every content id ever
+    # issued against it, and nothing else checks that the two halves still agree.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Every vector digest is the SHA-256 of its own canonical bytes
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, sys
+          vector = json.load(open("contracts/canonical-json/vector.json"))
+          bad = 0
+          for case in vector["cases"]:
+              want = "sha256:" + hashlib.sha256(case["canonical"].encode("utf-8")).hexdigest()
+              if want != case["content_id"]:
+                  print(f"{case['name']}: content_id does not match its canonical bytes", file=sys.stderr)
+                  bad += 1
+          print(f"{len(vector['cases'])} cases checked, {bad} inconsistent")
+          sys.exit(1 if bad else 0)
+          PY

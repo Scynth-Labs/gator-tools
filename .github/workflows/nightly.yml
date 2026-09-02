@@ -1,0 +1,81 @@
+name: Nightly
+
+# The checks CI cannot afford: a real Redis, adversarial input, and genuine
+# process contention. These are slow, need services, or are randomised — none
+# belongs on a pull request, and all of them find things unit tests cannot.
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  redis-backend:
+    # coord.test.mjs skips its Redis case when no server is reachable, so on
+    # every pull request that backend is untested. This is where it runs.
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_COORD_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm --prefix skills/multi-agent-coordination install --no-audit --no-fund
+      - name: Coordination suite with the Redis backend live
+        run: node --test skills/multi-agent-coordination/scripts/coord.test.mjs
+      - name: No case may silently skip once Redis is present
+        run: |
+          node --test skills/multi-agent-coordination/scripts/coord.test.mjs 2>&1 | tee out.txt
+          if grep -qE "^. skipped [1-9]" out.txt; then
+            echo "A case skipped even though Redis was reachable." >&2
+            exit 1
+          fi
+
+  differential-fuzz:
+    # The vector proves agreement on thirteen chosen cases. This proves it on
+    # documents nobody chose. The seed rotates daily, so a disagreement that
+    # only one shape triggers is found eventually rather than never — and the
+    # failure prints the seed, which reproduces it exactly.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Cross-language differential, rotating seed
+        run: |
+          SEED=$(date +%Y%m%d)
+          echo "seed $SEED"
+          node tests/differential-canonical.mjs --count 50000 --seed "$SEED"
+
+  contention:
+    # The unit suite exercises the state machine in one process, where the
+    # mutation lock is never contended. This runs real CLI processes racing for
+    # the same claim: a lost update here is two agents editing the same files
+    # believing they are alone.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: git config --global user.email "nightly@example.invalid"
+      - run: git config --global user.name "Nightly"
+      - name: Concurrent agents contend for one claim
+        run: node tests/concurrency-stress.mjs --agents 16 --rounds 5
