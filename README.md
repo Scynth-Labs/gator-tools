@@ -12,7 +12,7 @@ copied. One clone, one version, one place to fix a bug.
 ## Installing in a project
 
 ```sh
-git submodule add https://github.com/ShubhendraGautam/gator-tools gator-tools
+git submodule add https://github.com/Scynth-Labs/gator-tools gator-tools
 git commit -m "chore: vendor gator-tools"
 ```
 
