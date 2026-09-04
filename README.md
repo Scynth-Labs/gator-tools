@@ -5,7 +5,7 @@ copied. One clone, one version, one place to fix a bug.
 
 | | |
 | --- | --- |
-| [`skills/multi-agent-coordination`](skills/multi-agent-coordination/SKILL.md) | Coordinate several coding agents over one repository: joins, presence leases, exclusive file claims, named-reviewer quorums, blocking design questions, handoffs, and commit-pinned merge gates. Local Git backend by default; Redis Streams when agents are on different machines. |
+| [`skills/multi-agent-coordination`](skills/multi-agent-coordination/SKILL.md) | Run several coding agents on different aspects of one repository at the same time: planned lanes with provably disjoint file scope, a prioritized `next` worklist that ranks a partner's blocked work above your own, joins, presence leases, exclusive file claims, named-reviewer quorums, blocking design questions, handoffs, and commit-pinned merge gates. Local Git backend by default; Redis Streams when agents are on different machines. |
 | [`scripts/check-syntax.mjs`](scripts/check-syntax.mjs) | Parse every JavaScript file under the given roots and fail on the first syntax error. A gate, not a linter. |
 | [`contracts/canonical-json`](contracts/canonical-json/CONTRACT.md) | One byte representation for a JSON value and one SHA-256 content id, frozen as a vector so implementations in different languages cannot drift apart. Reference implementations in JavaScript and Python, plus verifiers for checking your own. |
 
@@ -44,11 +44,22 @@ working directory:
 ```sh
 node gator-tools/skills/multi-agent-coordination/scripts/coord.mjs init \
   --backend local --project my-project --base main \
-  --integrator maintainer --queue TASKS.md --review-quorum 1
+  --integrator maintainer --queue TASKS.md --review-quorum 1 \
+  --base-advance disjoint --review-debt-limit 900
 ```
 
 Point your agent instructions — `AGENTS.md`, `CLAUDE.md`, or `.claude/` — at
 that path so an agent finds it without being told each session.
+
+Two agents are faster than one only while they are building different things.
+The skill makes that the default shape of the work: `assign` records one aspect,
+one owner, and one set of exclusive paths per lane and refuses any lane that
+overlaps another, and `next --agent <you>` answers "what should I do now" with a
+partner's blocked review ranked above an agent's own implementation. Every other
+command ends by naming whoever is waiting, which is what a long session
+otherwise forgets. The two flags above are what make parallel lanes pay: a ready
+round survives a base advance git proves missed its files, and an agent sitting
+on a peer's review for fifteen minutes is refused new work until it clears.
 
 State lives under the consuming repository's `.git/multi-agent-coordination/`,
 never here. Nothing in this repository is written to at runtime.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,15 +52,16 @@ function repository() {
   return path;
 }
 
-function initialize(repo, { backend = "local", project = "fixture", quorum = 2, env = {} } = {}) {
-  coord(repo, [
+function initialize(repo, { backend = "local", project = "fixture", quorum = 2, env = {}, extra = [] } = {}) {
+  const output = coord(repo, [
     "init", "--backend", backend, "--project", project, "--base", "main",
     "--integrator", "integrator", "--queue", "TASKS.md", "--shared", "TASKS.md",
-    "--review-quorum", String(quorum), "--lease", "120",
+    "--review-quorum", String(quorum), "--lease", "120", ...extra,
   ], 0, env);
   for (const agent of ["alpha", "beta", "gamma", "integrator"]) {
     coord(repo, ["join", "--agent", agent, "--metadata", JSON.stringify({ runtime: agent })], 0, env);
   }
+  return output;
 }
 
 test("broadcasts to every joined agent while keeping direct messages private", async () => {
@@ -320,6 +321,253 @@ test("a squash-merged claim closes only against an equivalent commit", async () 
     coord(repo, ["done", "T1", "--agent", "worker", "--note", "squash-merged into main", "--merged-as", squashed]);
     const status = coord(repo, ["status"]);
     assert.match(status, /T1\s+done/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("plans disjoint lanes, refuses ones that cannot run in parallel, and hands scope to the claim", () => {
+  const repo = repository();
+  try {
+    initialize(repo, { quorum: 1 });
+    coord(repo, ["assign", "LANE-1", "--agent", "integrator", "--to", "alpha", "--aspect", "storage layer", "--files", "src/store.js", "--reviewers", "beta"]);
+
+    // Two lanes over one path are not parallel lanes; that is the whole premise.
+    const overlap = coord(repo, ["assign", "LANE-2", "--agent", "integrator", "--to", "beta", "--aspect", "cache", "--files", "src/store.js", "--reviewers", "alpha"], 1);
+    assert.match(overlap, /cannot run in parallel/);
+    const unknown = coord(repo, ["assign", "LANE-2", "--agent", "integrator", "--to", "beta", "--aspect", "cache", "--files", "src/cache.js", "--reviewers", "alpha", "--needs", "LANE-404"], 1);
+    assert.match(unknown, /neither assigned nor claimed/);
+    const owned = coord(repo, ["assign", "LANE-2", "--agent", "integrator", "--to", "beta", "--aspect", "cache", "--files", "src/cache.js", "--reviewers", "beta"], 1);
+    assert.match(owned, /cannot review its own work/);
+
+    coord(repo, ["assign", "LANE-2", "--agent", "integrator", "--to", "beta", "--aspect", "http surface", "--files", "src/http.js", "--reviewers", "alpha", "--needs", "LANE-1"]);
+    assert.match(coord(repo, ["status"]), /LANE-2\s+beta\s+http surface\s+1\s+alpha\s+LANE-1/);
+
+    // The assignee is the only agent who may take the lane, and the claim inherits
+    // its scope and reviewers rather than restating them.
+    git(repo, "switch", "-c", "feat/lane-1");
+    assert.match(coord(repo, ["claim", "LANE-1", "--agent", "beta", "--branch", "feat/lane-1"], 1), /assigned to alpha/);
+    assert.match(coord(repo, ["claim", "LANE-1", "--agent", "alpha", "--branch", "feat/lane-1"]), /storage layer.*reviewers beta/s);
+    assert.match(coord(repo, ["status"]), /LANE-1\s+claimed\s+alpha\s+storage layer/);
+
+    // A lane other work was planned behind cannot simply evaporate.
+    assert.match(coord(repo, ["release", "LANE-1", "--agent", "alpha"], 1), /LANE-2 still depend/);
+    assert.match(coord(repo, ["unassign", "LANE-2", "--agent", "integrator", "--reason", "re-planned into the storage lane"]), /withdrawn from beta/);
+    coord(repo, ["release", "LANE-1", "--agent", "alpha"]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("ranks a partner's blocked work above an agent's own and says so from any command", () => {
+  const repo = repository();
+  try {
+    initialize(repo, { quorum: 1 });
+    coord(repo, ["assign", "LANE-2", "--agent", "integrator", "--to", "beta", "--aspect", "http surface", "--files", "src/http.js", "--reviewers", "alpha"]);
+
+    git(repo, "switch", "-c", "feat/lane-1");
+    coord(repo, ["claim", "LANE-1", "--agent", "alpha", "--branch", "feat/lane-1", "--files", "src/store.js", "--reviewers", "beta"]);
+    writeFileSync(join(repo, "src", "store.js"), "export const store = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "store");
+    coord(repo, ["ready", "LANE-1", "--agent", "alpha", "--evidence", "store suite green at src/store.js:1"]);
+
+    // beta owes alpha a review, and learns it without having to ask.
+    const betaNext = coord(repo, ["next", "--agent", "beta"]);
+    assert.match(betaNext, /1 blocking a partner/);
+    assert.match(betaNext, /BLOCKING {2}review LANE-1 for alpha/);
+    assert.match(betaNext, /LANE {6}LANE-2 \(http surface\) 1 path/);
+    // The obligation is printed before beta's own lane, not after it.
+    assert.ok(betaNext.indexOf("BLOCKING") < betaNext.indexOf("LANE  "), betaNext);
+    // Any ordinary command repeats it, which is what a long session forgets.
+    assert.match(coord(repo, ["status", "--agent", "beta"]), /BLOCKED ON YOU: review LANE-1 for alpha/);
+    assert.doesNotMatch(coord(repo, ["heartbeat", "--agent", "integrator"]), /BLOCKED ON YOU/);
+
+    // An open question invalidates the round, so the review obligation gives way
+    // to the answer the asker is now blocked on.
+    coord(repo, ["ask", "LANE-1", "--agent", "alpha", "--to", "gamma", "--question", "Should the store key include the tenant?"]);
+    assert.doesNotMatch(coord(repo, ["heartbeat", "--agent", "beta"]), /BLOCKED ON YOU/);
+    assert.match(coord(repo, ["next", "--agent", "gamma"]), /BLOCKING {2}answer LANE-1 for alpha/);
+    assert.match(coord(repo, ["heartbeat", "--agent", "gamma"]), /BLOCKED ON YOU: answer LANE-1 for alpha/);
+
+    // Discharging it clears the reminder.
+    coord(repo, ["answer", "LANE-1", "--agent", "gamma", "--text", "Derive it from the tenant already on the event"]);
+    assert.doesNotMatch(coord(repo, ["heartbeat", "--agent", "gamma"]), /BLOCKED ON YOU/);
+    assert.match(coord(repo, ["next", "--agent", "alpha"]), /YOURS {5}LANE-1 claimed — implement/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("a lane starts on a reviewed dependency but cannot be declared ready before it lands", () => {
+  const repo = repository();
+  try {
+    initialize(repo, { quorum: 1 });
+    coord(repo, ["assign", "L1", "--agent", "integrator", "--to", "alpha", "--aspect", "storage layer", "--files", "src/store.js", "--reviewers", "beta"]);
+    coord(repo, ["assign", "L2", "--agent", "integrator", "--to", "beta", "--aspect", "http surface", "--files", "src/http.js", "--reviewers", "alpha", "--needs", "L1"]);
+
+    git(repo, "switch", "-c", "feat/l2");
+    assert.match(coord(repo, ["claim", "L2", "--agent", "beta", "--branch", "feat/l2"], 1), /depends on L1, which has not reached a reviewed commit/);
+    assert.match(coord(repo, ["next", "--agent", "beta"]), /LANE {6}L2 \(http surface\) blocked by L1/);
+
+    git(repo, "switch", "main");
+    git(repo, "switch", "-c", "feat/l1");
+    coord(repo, ["claim", "L1", "--agent", "alpha", "--branch", "feat/l1"]);
+    writeFileSync(join(repo, "src", "store.js"), "export const store = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "store");
+    coord(repo, ["ready", "L1", "--agent", "alpha", "--evidence", "store suite green at src/store.js:1"]);
+
+    // A reviewed commit is enough to build against, so the second lane starts now
+    // rather than after the merge.
+    git(repo, "switch", "feat/l2");
+    coord(repo, ["claim", "L2", "--agent", "beta", "--branch", "feat/l2"]);
+    writeFileSync(join(repo, "src", "http.js"), "export const http = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "http");
+    assert.match(coord(repo, ["ready", "L2", "--agent", "beta", "--evidence", "handler suite green at src/http.js:1"], 1), /depends on L1, which is not merged yet/);
+
+    git(repo, "switch", "feat/l1");
+    coord(repo, ["review", "L1", "--agent", "beta", "--verdict", "approve", "--evidence", "read src/store.js:1 and ran the store suite"]);
+    coord(repo, ["gate", "L1", "--agent", "integrator"]);
+    git(repo, "switch", "main");
+    git(repo, "merge", "--ff-only", "feat/l1");
+    coord(repo, ["done", "L1", "--agent", "alpha", "--note", "fast-forwarded into main after quorum approval"]);
+
+    git(repo, "switch", "feat/l2");
+    coord(repo, ["ready", "L2", "--agent", "beta", "--evidence", "handler suite green at src/http.js:1"]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("a ready round survives only a base advance git proves missed the claim's own files", () => {
+  const repo = repository();
+  try {
+    initialize(repo, { quorum: 1, extra: ["--base-advance", "disjoint"] });
+    git(repo, "switch", "-c", "feat/one");
+    coord(repo, ["claim", "T1", "--agent", "alpha", "--branch", "feat/one", "--files", "src/store.js", "--reviewers", "beta"]);
+    writeFileSync(join(repo, "src", "store.js"), "export const store = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "store");
+    coord(repo, ["ready", "T1", "--agent", "alpha", "--evidence", "store suite green at src/store.js:1"]);
+
+    // A peer lane merges. It touched nothing this claim declared, so the round
+    // stands and the reviewer is told the base moved anyway.
+    git(repo, "switch", "main");
+    writeFileSync(join(repo, "src", "other.js"), "export const other = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "a peer lane lands");
+    git(repo, "switch", "feat/one");
+    const review = coord(repo, ["review", "T1", "--agent", "beta", "--verdict", "approve", "--evidence", "read src/store.js:1 and ran the store suite"]);
+    assert.match(review, /main advanced [0-9a-f]{12}\.\.[0-9a-f]{12} over 1 file, none in this claim's scope; round kept/);
+    assert.match(coord(repo, ["gate", "T1", "--agent", "integrator"]), /GATE PASS/);
+
+    // A base advance into the claim's own scope is a different change under
+    // review, and both the reviewer and the gate must refuse it.
+    git(repo, "switch", "main");
+    writeFileSync(join(repo, "src", "store.js"), "export const store = 99;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "someone else edits the store");
+    git(repo, "switch", "feat/one");
+    assert.match(coord(repo, ["review", "T1", "--agent", "beta", "--verdict", "approve", "--evidence", "re-read src/store.js:1 after the base moved"], 1), /advanced into this claim's own scope \(src\/store\.js\)/);
+    assert.match(coord(repo, ["gate", "T1", "--agent", "integrator"], 1), /advanced into this claim's own scope/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("the strict default refuses even a disjoint base advance", () => {
+  const repo = repository();
+  try {
+    initialize(repo, { quorum: 1 });
+    git(repo, "switch", "-c", "feat/strict");
+    coord(repo, ["claim", "T1", "--agent", "alpha", "--branch", "feat/strict", "--files", "src/store.js", "--reviewers", "beta"]);
+    writeFileSync(join(repo, "src", "store.js"), "export const store = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "store");
+    coord(repo, ["ready", "T1", "--agent", "alpha", "--evidence", "store suite green at src/store.js:1"]);
+
+    git(repo, "switch", "main");
+    writeFileSync(join(repo, "src", "other.js"), "export const other = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "a peer lane lands");
+    git(repo, "switch", "feat/strict");
+    assert.match(coord(repo, ["review", "T1", "--agent", "beta", "--verdict", "approve", "--evidence", "read src/store.js:1 and ran the store suite"], 1), /Integration base moved since ready/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("refuses to start or finish work while a partner is blocked past the debt limit", async () => {
+  const repo = repository();
+  try {
+    initialize(repo, { quorum: 1, extra: ["--review-debt-limit", "1"] });
+    git(repo, "switch", "-c", "feat/first");
+    coord(repo, ["claim", "T1", "--agent", "alpha", "--branch", "feat/first", "--files", "src/store.js", "--reviewers", "beta"]);
+    writeFileSync(join(repo, "src", "store.js"), "export const store = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "store");
+    coord(repo, ["ready", "T1", "--agent", "alpha", "--evidence", "store suite green at src/store.js:1"]);
+
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    git(repo, "switch", "main");
+    git(repo, "switch", "-c", "feat/second");
+    const refusal = coord(repo, ["claim", "T2", "--agent", "beta", "--branch", "feat/second", "--files", "src/http.js", "--reviewers", "alpha"], 1);
+    assert.match(refusal, /Cannot claim T2 while a partner has been blocked on you longer than 1s: T1 \(review for alpha/);
+
+    // The debt is always dischargeable: review is never itself gated.
+    git(repo, "switch", "feat/first");
+    coord(repo, ["review", "T1", "--agent", "beta", "--verdict", "approve", "--evidence", "read src/store.js:1 and ran the store suite"]);
+    git(repo, "switch", "feat/second");
+    coord(repo, ["claim", "T2", "--agent", "beta", "--branch", "feat/second", "--files", "src/http.js", "--reviewers", "alpha"]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("a board created before these policies attaches unchanged, and the integrator opts in deliberately", () => {
+  const repo = repository();
+  try {
+    initialize(repo, { quorum: 1 });
+
+    // Simulate a board created by the previous release: the two policy keys did
+    // not exist, and six repositories vendor boards in exactly that shape.
+    const coordinationDirectory = join(repo, ".git", "multi-agent-coordination");
+    for (const file of ["config.json", "state.json"]) {
+      const path = join(coordinationDirectory, file);
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      const target = file === "config.json" ? parsed : parsed.policy;
+      delete target.baseAdvance;
+      delete target.reviewDebtLimit;
+      writeFileSync(path, JSON.stringify(parsed, null, 2));
+    }
+
+    git(repo, "switch", "-c", "feat/legacy");
+    coord(repo, ["claim", "T1", "--agent", "alpha", "--branch", "feat/legacy", "--files", "src/store.js", "--reviewers", "beta"]);
+    writeFileSync(join(repo, "src", "store.js"), "export const store = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "store");
+    coord(repo, ["ready", "T1", "--agent", "alpha", "--evidence", "store suite green at src/store.js:1"]);
+
+    // Attaching again refreshes the local file rather than refusing over keys
+    // that were only added later.
+    assert.match(initialize(repo, { quorum: 1 }), /Refreshed local config to match the board: baseAdvance, reviewDebtLimit/);
+
+    // Absent keys read as the strict default until someone changes them on the
+    // board, which only the integrator can do and which is recorded.
+    git(repo, "switch", "main");
+    writeFileSync(join(repo, "src", "other.js"), "export const other = 1;\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "a peer lane lands");
+    git(repo, "switch", "feat/legacy");
+    const approve = ["review", "T1", "--agent", "beta", "--verdict", "approve", "--evidence", "read src/store.js:1 and ran the store suite"];
+    assert.match(coord(repo, approve, 1), /Integration base moved since ready/);
+
+    assert.match(coord(repo, ["policy", "--agent", "alpha", "--base-advance", "disjoint", "--reason", "adopting parallel lanes this week"], 1), /Only configured integrator/);
+    assert.match(coord(repo, ["policy", "--agent", "integrator", "--base-advance", "disjoint", "--reason", "adopting parallel lanes this week"]), /base advance disjoint/);
+    assert.match(coord(repo, approve), /round kept/);
+    assert.match(coord(repo, ["log", "--limit", "20"]), /policy\.changed/);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

@@ -50,6 +50,7 @@ export function initialState(policy) {
     policy: structuredClone(policy),
     agents: {},
     claims: {},
+    assignments: {},
     createdAt: now(),
   };
 }
@@ -58,6 +59,9 @@ export function assertCompatibleState(state, policy) {
   if (state?.version !== 2 || !state.policy || !state.agents || !state.claims) fail("Coordination state has an unsupported format");
   for (const key of ["project", "base", "queue", "reviewQuorum", "integrator", "streamMaxLength"]) {
     if (state.policy[key] !== policy[key]) fail(`Existing project policy disagrees on ${key}`);
+  }
+  for (const [key, fallback] of Object.entries(POLICY_DEFAULTS)) {
+    if ((state.policy[key] ?? fallback) !== (policy[key] ?? fallback)) fail(`Existing project policy disagrees on ${key}`);
   }
   const existingShared = JSON.stringify([...(state.policy.shared || [])].sort());
   const requestedShared = JSON.stringify([...(policy.shared || [])].sort());
@@ -151,6 +155,11 @@ export function claimTask(state, { id, agent, branch, files, reviewers }) {
   requireJoined(state, agent);
   if (state.claims[id]) fail(`${id} is already ${state.claims[id].state} by ${state.claims[id].agent}`);
   if (!branch) fail("A claim requires an existing feature branch");
+  const lane = (state.assignments || {})[id] || null;
+  if (lane && lane.assignee !== agent) fail(`${id} is assigned to ${lane.assignee}; take one of your own lanes or have it reassigned`);
+  const unmet = unmetDependencies(state, lane?.needs || [], "claim");
+  if (unmet.length) fail(`${id} depends on ${unmet.join(", ")}, which ${unmet.length === 1 ? "has" : "have"} not reached a reviewed commit yet`);
+  assertPeerDebt(state, agent, `claim ${id}`);
   const uniqueReviewers = [...new Set(reviewers.map(validateAgent))];
   if (uniqueReviewers.includes(agent)) fail("The claim owner cannot review its own work");
   if (uniqueReviewers.length < state.policy.reviewQuorum) fail(`Claim needs at least ${state.policy.reviewQuorum} named reviewer(s)`);
@@ -160,6 +169,14 @@ export function claimTask(state, { id, agent, branch, files, reviewers }) {
     for (const file of files) {
       for (const declared of claim.files || []) {
         if (pathsOverlap(file, declared)) fail(`${file} overlaps ${declared}, held by ${claim.agent} for ${otherId}`);
+      }
+    }
+  }
+  for (const [otherId, other] of Object.entries(state.assignments || {})) {
+    if (otherId === id) continue;
+    for (const file of files) {
+      for (const declared of other.files || []) {
+        if (pathsOverlap(file, declared)) fail(`${file} overlaps ${declared}, assigned to ${other.assignee} for ${otherId}`);
       }
     }
   }
@@ -174,8 +191,12 @@ export function claimTask(state, { id, agent, branch, files, reviewers }) {
     claimedAt: at,
     reviews: [],
     readiness: [],
+    ...(lane ? { aspect: lane.aspect, needs: lane.needs, assignedBy: lane.assigner } : {}),
   };
-  return { result: state.claims[id], events: [event("claim.created", agent, { task: id, payload: { branch, files, reviewers: uniqueReviewers, quorum: state.policy.reviewQuorum } })] };
+  // A lane becomes the claim it planned; the assignment record stops existing so
+  // scope is declared in exactly one place.
+  if (lane) delete state.assignments[id];
+  return { result: state.claims[id], events: [event("claim.created", agent, { task: id, payload: { branch, files, reviewers: uniqueReviewers, quorum: state.policy.reviewQuorum, ...(lane ? { aspect: lane.aspect, needs: lane.needs } : {}) } })] };
 }
 
 export function amendClaim(state, { id, agent, files }) {
@@ -277,6 +298,9 @@ export function markReady(state, { id, agent, head, baseHead, evidence }) {
   requireActive(claim, id);
   requireOwner(claim, agent, id);
   if (claim.openQuestion) fail(`${id} still has an open question for ${claim.waitingOn}`);
+  const unmet = unmetDependencies(state, claim.needs || [], "ready");
+  if (unmet.length) fail(`${id} depends on ${unmet.join(", ")}, which ${unmet.length === 1 ? "is" : "are"} not merged yet; readiness would review against work that can still change`);
+  assertPeerDebt(state, agent, `mark ${id} ready`);
   const ready = { id: randomUUID(), head, baseHead, evidence: requireEvidence(evidence), at: now() };
   claim.ready = ready;
   claim.readiness = [...(claim.readiness || []), ready];
@@ -284,14 +308,14 @@ export function markReady(state, { id, agent, head, baseHead, evidence }) {
   return { result: claim, events: [event("claim.ready", agent, { task: id, payload: { head, baseHead, readyId: ready.id, reviewers: claim.reviewers, quorum: claim.quorum } })] };
 }
 
-export function reviewClaim(state, { id, agent, verdict, evidence, head, baseHead }) {
+export function reviewClaim(state, { id, agent, verdict, evidence, head, baseHead, baseAdvance = null }) {
   requireJoined(state, agent);
   const claim = requireClaim(state, id);
   if (claim.agent === agent) fail("Review another agent's work, not your own");
   if (!claim.reviewers.includes(agent)) fail(`${agent} is not a named reviewer for ${id}`);
   if (!claim.ready || claim.state !== "ready") fail(`${id} has no current ready round`);
   if (claim.ready.head !== head) fail(`Review exact ready commit ${claim.ready.head}; current HEAD is ${head}`);
-  if (claim.ready.baseHead !== baseHead) fail(`Integration base moved since ready; the owner must synchronize and create a new ready round`);
+  acceptBaseAdvance(state, claim, baseHead, baseAdvance);
   if (!["approve", "changes"].includes(verdict)) fail("Review verdict must be approve or changes");
   const review = { agent, verdict, evidence: requireEvidence(evidence, 20), head, readyId: claim.ready.id, at: now() };
   claim.reviews = [...(claim.reviews || []), review];
@@ -325,6 +349,14 @@ export function releaseClaim(state, { id, agent, forced = false, authority = nul
   }
   if (claim.agent !== agent) {
     if (!forced) fail(`${id} is held by ${claim.agent}; forced release requires explicit human authority`);
+  }
+  // Releasing a claim other lanes were planned behind would strand them: their
+  // dependency stops existing, so nothing could satisfy it again.
+  if (!forced) {
+    const dependants = Object.entries({ ...(state.assignments || {}), ...state.claims })
+      .filter(([otherId, other]) => otherId !== id && (other.needs || []).includes(id) && other.state !== "done")
+      .map(([otherId]) => otherId);
+    if (dependants.length) fail(`${dependants.join(", ")} still depend on ${id}; re-plan them before releasing it`);
   }
   delete state.claims[id];
   return { result: claim, events: [event(forced ? "claim.forced-release" : "claim.release", agent, { task: id, payload: forced ? { authority, reason, previousAgent: claim.agent } : null })] };
@@ -364,4 +396,253 @@ export function liveAgents(state, at = Date.now()) {
 
 export function matchingEvents(events, agent) {
   return events.filter((item) => item.to === "*" || item.to === agent);
+}
+
+// Policy keys added after a project was initialized. assertCompatibleState reads
+// an absent key as its default, so an existing board attaches to a newer CLI
+// without a migration and disagrees only when a consumer really changed one.
+export const POLICY_DEFAULTS = { baseAdvance: "strict", reviewDebtLimit: 0 };
+
+export function requireAspect(value) {
+  const aspect = String(value || "").trim();
+  if (aspect.length < 3 || aspect.length > 80) fail("Name the aspect this lane owns in 3-80 characters, such as \"storage layer\"");
+  return aspect;
+}
+
+export function formatAge(milliseconds) {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function dependencyState(state, id) {
+  const claim = state.claims[id];
+  if (claim) return claim.state;
+  if ((state.assignments || {})[id]) return "assigned";
+  return "unknown";
+}
+
+// A lane may start once what it depends on exists at a reviewed commit, but it
+// may not declare itself ready until that dependency has actually landed —
+// otherwise its own review covers work that can still change underneath it.
+export function unmetDependencies(state, needs, stage) {
+  const satisfying = stage === "ready" ? ["done"] : ["ready", "done"];
+  return (needs || []).filter((id) => !satisfying.includes(dependencyState(state, id)));
+}
+
+function dependencyEdges(state, id, needs) {
+  const edges = new Map();
+  for (const [key, claim] of Object.entries(state.claims)) if (claim.needs?.length) edges.set(key, claim.needs);
+  for (const [key, lane] of Object.entries(state.assignments || {})) if (lane.needs?.length) edges.set(key, lane.needs);
+  edges.set(id, needs);
+  return edges;
+}
+
+function dependencyCycle(state, id, needs) {
+  const edges = dependencyEdges(state, id, needs);
+  const walk = (node, trail) => {
+    for (const next of edges.get(node) || []) {
+      if (next === id) return [...trail, next];
+      if (trail.includes(next)) continue;
+      const found = walk(next, [...trail, next]);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(id, [id]);
+}
+
+export function assignTask(state, { id, agent, to, aspect, files, reviewers, needs }) {
+  validateId(id);
+  requireJoined(state, agent);
+  const assignee = validateAgent(to);
+  requireJoined(state, assignee);
+  if (state.claims[id]) fail(`${id} is already ${state.claims[id].state} by ${state.claims[id].agent}`);
+  if (!state.assignments) state.assignments = {};
+  if (state.assignments[id]) fail(`${id} is already assigned to ${state.assignments[id].assignee}; unassign it first`);
+  const lane = requireAspect(aspect);
+  const declared = [...new Set(files)].sort();
+  if (!declared.length) fail("A lane needs at least one exclusive path; disjoint scope is what lets lanes run at the same time");
+  const uniqueReviewers = [...new Set(reviewers.map(validateAgent))];
+  if (uniqueReviewers.includes(assignee)) fail("A lane's owner cannot review its own work");
+  if (uniqueReviewers.length < state.policy.reviewQuorum) fail(`Lane needs at least ${state.policy.reviewQuorum} named reviewer(s)`);
+  for (const reviewer of uniqueReviewers) requireJoined(state, reviewer);
+  for (const [otherId, claim] of Object.entries(state.claims)) {
+    if (!["claimed", "ready"].includes(claim.state)) continue;
+    for (const file of declared) for (const held of claim.files || []) {
+      if (pathsOverlap(file, held)) fail(`${file} overlaps ${held}, held by ${claim.agent} for ${otherId}; these cannot run in parallel`);
+    }
+  }
+  for (const [otherId, other] of Object.entries(state.assignments)) {
+    for (const file of declared) for (const held of other.files || []) {
+      if (pathsOverlap(file, held)) fail(`${file} overlaps ${held}, assigned to ${other.assignee} for ${otherId}; these cannot run in parallel`);
+    }
+  }
+  const dependencies = [...new Set((needs || []).map(validateId))];
+  for (const need of dependencies) {
+    if (need === id) fail(`${id} cannot depend on itself`);
+    if (dependencyState(state, need) === "unknown") fail(`${id} cannot depend on ${need}, which is neither assigned nor claimed`);
+  }
+  const cycle = dependencyCycle(state, id, dependencies);
+  if (cycle) fail(`That dependency closes a cycle and nothing in it could ever start: ${cycle.join(" -> ")}`);
+  state.assignments[id] = {
+    aspect: lane,
+    assignee,
+    assigner: agent,
+    files: declared,
+    reviewers: uniqueReviewers,
+    needs: dependencies,
+    assignedAt: now(),
+  };
+  return {
+    result: state.assignments[id],
+    events: [event("lane.assigned", agent, { to: assignee, task: id, payload: { aspect: lane, files: declared, reviewers: uniqueReviewers, needs: dependencies } })],
+  };
+}
+
+export function unassignTask(state, { id, agent, reason }) {
+  requireJoined(state, agent);
+  validateId(id);
+  const lane = (state.assignments || {})[id];
+  if (!lane) fail(`${id} is not an open assignment`);
+  if (![lane.assignee, lane.assigner, state.policy.integrator].includes(agent)) {
+    fail(`${id} belongs to ${lane.assignee}; only its assignee, ${lane.assigner}, or integrator ${state.policy.integrator} may withdraw it`);
+  }
+  const evidence = requireEvidence(reason, 20);
+  const dependants = Object.entries({ ...state.assignments, ...state.claims })
+    .filter(([otherId, other]) => otherId !== id && (other.needs || []).includes(id) && other.state !== "done")
+    .map(([otherId]) => otherId);
+  if (dependants.length) fail(`${dependants.join(", ")} still depend on ${id}; withdraw or re-plan those first`);
+  delete state.assignments[id];
+  return { result: lane, events: [event("lane.unassigned", agent, { to: lane.assignee, task: id, payload: { reason: evidence } })] };
+}
+
+// What other agents are currently stalled on this one. This is the whole point:
+// every command can report it, so an agent cannot work for an hour without being
+// told a partner is waiting.
+export function pendingReviews(state, agent, atMs = Date.now()) {
+  const pending = [];
+  for (const [id, claim] of Object.entries(state.claims)) {
+    if (claim.state !== "ready" || !claim.ready) continue;
+    if (claim.agent === agent || !(claim.reviewers || []).includes(agent)) continue;
+    if ((claim.reviews || []).some((review) => review.agent === agent && review.readyId === claim.ready.id)) continue;
+    pending.push({ id, kind: "review", owner: claim.agent, head: claim.ready.head, readyId: claim.ready.id, since: claim.ready.at, waitingMs: atMs - Date.parse(claim.ready.at) });
+  }
+  return pending.sort((left, right) => right.waitingMs - left.waitingMs);
+}
+
+export function pendingQuestions(state, agent, atMs = Date.now()) {
+  const pending = [];
+  for (const [id, claim] of Object.entries(state.claims)) {
+    if (!["claimed", "ready"].includes(claim.state) || claim.waitingOn !== agent || !claim.openQuestion) continue;
+    pending.push({ id, kind: "question", owner: claim.openQuestion.from, question: claim.openQuestion.question, since: claim.openQuestion.at, waitingMs: atMs - Date.parse(claim.openQuestion.at) });
+  }
+  return pending.sort((left, right) => right.waitingMs - left.waitingMs);
+}
+
+export function pendingGates(state, agent, atMs = Date.now()) {
+  if (agent !== state.policy.integrator) return [];
+  const pending = [];
+  for (const [id, claim] of Object.entries(state.claims)) {
+    if (claim.state !== "ready" || !claim.ready || claim.openQuestion) continue;
+    if (!approvalSummary(claim).satisfied) continue;
+    pending.push({ id, kind: "gate", owner: claim.agent, head: claim.ready.head, since: claim.ready.at, waitingMs: atMs - Date.parse(claim.ready.at) });
+  }
+  return pending.sort((left, right) => right.waitingMs - left.waitingMs);
+}
+
+export function obligations(state, agent, atMs = Date.now()) {
+  return [...pendingQuestions(state, agent, atMs), ...pendingReviews(state, agent, atMs), ...pendingGates(state, agent, atMs)]
+    .sort((left, right) => right.waitingMs - left.waitingMs);
+}
+
+// Refusing to start or finish work while a partner has been blocked past the
+// configured limit. It cannot deadlock: the debt is always dischargeable, since
+// review and answer are never themselves gated.
+export function assertPeerDebt(state, agent, action, atMs = Date.now()) {
+  const limit = Number(state.policy?.reviewDebtLimit ?? POLICY_DEFAULTS.reviewDebtLimit);
+  if (!limit) return [];
+  const overdue = [...pendingQuestions(state, agent, atMs), ...pendingReviews(state, agent, atMs)]
+    .filter((item) => item.waitingMs >= limit * 1000)
+    .sort((left, right) => right.waitingMs - left.waitingMs);
+  if (!overdue.length) return [];
+  const detail = overdue.map((item) => `${item.id} (${item.kind} for ${item.owner}, waiting ${formatAge(item.waitingMs)})`).join(", ");
+  fail(`Cannot ${action} while a partner has been blocked on you longer than ${formatAge(limit * 1000)}: ${detail}. Clear it with review or answer first.`);
+}
+
+function claimNeed(state, id, claim, atMs) {
+  if (claim.openQuestion) return { action: "blocked", detail: `waiting on ${claim.waitingOn} for ${formatAge(atMs - Date.parse(claim.openQuestion.at))}` };
+  if (claim.state === "ready") {
+    const summary = approvalSummary(claim);
+    if (summary.satisfied) return { action: "gate", detail: `quorum met; integrator ${state.policy.integrator} can gate ${id}` };
+    return { action: "await-review", detail: `${summary.approved.length}/${claim.quorum} approved; waiting on ${summary.missing.join(", ")}` };
+  }
+  const unmet = unmetDependencies(state, claim.needs || [], "ready");
+  if (unmet.length) return { action: "implement", detail: `implement now, but ${unmet.join(", ")} must merge before ready` };
+  return { action: "implement", detail: "implement, then record ready" };
+}
+
+// One prioritized answer to "what do I do next", with a partner's blocked work
+// ranked above this agent's own.
+export function worklist(state, agent, atMs = Date.now()) {
+  const own = Object.entries(state.claims)
+    .filter(([, claim]) => ["claimed", "ready"].includes(claim.state) && claim.agent === agent)
+    .map(([id, claim]) => ({ id, aspect: claim.aspect || null, state: claim.state, ...claimNeed(state, id, claim, atMs) }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const lanes = Object.entries(state.assignments || {})
+    .filter(([, lane]) => lane.assignee === agent)
+    .map(([id, lane]) => ({ id, aspect: lane.aspect, files: lane.files, reviewers: lane.reviewers, blockedBy: unmetDependencies(state, lane.needs, "claim") }))
+    .sort((left, right) => left.blockedBy.length - right.blockedBy.length || left.id.localeCompare(right.id));
+  return { obligations: obligations(state, agent, atMs), own, lanes };
+}
+
+function baseAdvanceRefusal(state, claim, baseHead, proof) {
+  const stale = "Integration base moved since ready; the owner must synchronize and create a new ready round";
+  if ((state.policy?.baseAdvance ?? POLICY_DEFAULTS.baseAdvance) !== "disjoint") return stale;
+  if (!proof || proof.from !== claim.ready.baseHead || proof.to !== baseHead) return stale;
+  if (!proof.fastForward) return `${stale}: the base was rewritten rather than advanced`;
+  if (proof.touched?.length) return `Integration base advanced into this claim's own scope (${proof.touched.join(", ")}); synchronize and create a new ready round`;
+  return null;
+}
+
+// Under the disjoint policy a base advance that git proves touched none of the
+// claim's declared files leaves the round standing, so parallel lanes do not
+// re-review each other's merges. It proves only that: cross-lane semantic
+// conflicts remain the project's merge-time checks to catch.
+export function acceptBaseAdvance(state, claim, baseHead, proof) {
+  if (!claim.ready || claim.ready.baseHead === baseHead) return null;
+  const refusal = baseAdvanceRefusal(state, claim, baseHead, proof);
+  if (refusal) fail(refusal);
+  const record = { from: proof.from, to: baseHead, changed: proof.changed, at: now() };
+  claim.ready.baseHead = baseHead;
+  claim.ready.baseAdvances = [...(claim.ready.baseAdvances || []), record];
+  return record;
+}
+
+export function baseAdvanceBlocks(state, claim, baseHead, proof) {
+  if (!claim?.ready || claim.ready.baseHead === baseHead) return null;
+  return baseAdvanceRefusal(state, claim, baseHead, proof);
+}
+
+// The board is the source of truth for policy, so changing it is one recorded
+// act by the integrator rather than an edit to a local config file that other
+// machines would never see.
+export function setPolicy(state, { agent, baseAdvance, reviewDebtLimit, reason }) {
+  requireJoined(state, agent);
+  if (agent !== state.policy.integrator) fail(`Only configured integrator ${state.policy.integrator} may change coordination policy`);
+  const evidence = requireEvidence(reason, 20);
+  const before = {
+    baseAdvance: state.policy.baseAdvance ?? POLICY_DEFAULTS.baseAdvance,
+    reviewDebtLimit: state.policy.reviewDebtLimit ?? POLICY_DEFAULTS.reviewDebtLimit,
+  };
+  const after = {
+    baseAdvance: baseAdvance ?? before.baseAdvance,
+    reviewDebtLimit: reviewDebtLimit ?? before.reviewDebtLimit,
+  };
+  if (!["strict", "disjoint"].includes(after.baseAdvance)) fail("base-advance must be strict or disjoint");
+  if (after.baseAdvance === before.baseAdvance && after.reviewDebtLimit === before.reviewDebtLimit) fail("Coordination policy already has those values");
+  Object.assign(state.policy, after);
+  return { result: { before, after }, events: [event("policy.changed", agent, { payload: { before, after, reason: evidence } })] };
 }

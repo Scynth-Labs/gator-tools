@@ -9,10 +9,13 @@ import {
   answerQuestion,
   approvalSummary,
   askQuestion,
+  assignTask,
+  baseAdvanceBlocks,
   claimTask,
   commaList,
   completeClaim,
   fail,
+  formatAge,
   handoffClaim,
   heartbeatAgent,
   initialState,
@@ -20,16 +23,21 @@ import {
   leaveAgent,
   liveAgents,
   markReady,
+  obligations,
   pathCovered,
   readdressQuestion,
   releaseClaim,
   requireEvidence,
   reviewClaim,
+  setPolicy,
   setReviewers,
+  unassignTask,
+  unmetDependencies,
   validateAgent,
   validateId,
   validateProject,
   withdrawQuestion,
+  worklist,
 } from "./core.mjs";
 import { LocalStore, readJson, writeJsonAtomically } from "./local-store.mjs";
 import { RedisStore } from "./redis-store.mjs";
@@ -158,6 +166,28 @@ function printScope(result) {
   }
 }
 
+// Whether the integration base merely advanced past a ready round without
+// touching any file that round declared. Computed here because core.mjs never
+// shells out; it receives the proof and re-checks it.
+function baseAdvanceProof(claim, currentBase) {
+  const from = claim?.ready?.baseHead;
+  if (!from || from === currentBase) return null;
+  const fastForward = runGit(root, ["merge-base", "--is-ancestor", from, currentBase], { optional: true }) !== null;
+  const changed = fastForward ? gitLines(["diff", "--name-only", `${from}..${currentBase}`]) : [];
+  return {
+    from,
+    to: currentBase,
+    fastForward,
+    changed: changed.length,
+    touched: changed.filter((path) => pathCovered(path, claim.files || [])),
+  };
+}
+
+function invocation() {
+  const path = relative(process.cwd(), process.argv[1]);
+  return `node ${!path || path.startsWith("..") ? process.argv[1] : path}`;
+}
+
 function configPolicy(config) {
   return {
     project: config.project,
@@ -167,6 +197,8 @@ function configPolicy(config) {
     reviewQuorum: config.reviewQuorum,
     integrator: config.integrator,
     streamMaxLength: config.streamMaxLength,
+    baseAdvance: config.baseAdvance || "strict",
+    reviewDebtLimit: config.reviewDebtLimit || 0,
   };
 }
 
@@ -193,6 +225,28 @@ function formatEvent(item) {
   return `[${item.at}] ${item.from} ${item.type} ${address}${task}${detail ? `: ${detail}` : ""}`;
 }
 
+const SILENT_DIGEST = new Set(["next", "init", "help", "--help", "-h", "unlock", "log", "agents"]);
+
+async function printBlockedOnYou() {
+  if (!activeStore || SILENT_DIGEST.has(command)) return;
+  const agent = String(flags.agent || flags.from || "");
+  if (!/^[a-z0-9-]{1,48}$/.test(agent)) return;
+  try {
+    const state = await activeStore.readState();
+    if (!state.agents?.[agent]) return;
+    // Not the task this command just acted on: gate leaves its obligation
+    // standing until the merge is recorded, and restating it here reads as noise.
+    const pending = obligations(state, agent).filter((item) => item.id !== target);
+    if (!pending.length) return;
+    const verb = { question: "answer", review: "review", gate: "gate" };
+    const shown = pending.slice(0, 3).map((item) => `${verb[item.kind]} ${item.id} for ${item.owner} (${formatAge(item.waitingMs)})`);
+    const more = pending.length > shown.length ? `; +${pending.length - shown.length} more` : "";
+    console.log(`BLOCKED ON YOU: ${shown.join("; ")}${more} — ${invocation()} next --agent ${agent}`);
+  } catch {
+    // A digest must never mask the command's own result.
+  }
+}
+
 function usage() {
   console.log(`Multi-agent coordination (run from the target Git repository)
 
@@ -200,14 +254,21 @@ Setup and presence:
   init --backend local|redis --project P --base B --integrator A
        [--queue path --shared path,path --review-quorum N]
        [--lease seconds --stream-max-length N --redis-url-env NAME]
+       [--base-advance strict|disjoint --review-debt-limit seconds]
   join --agent A [--metadata '{"runtime":"codex"}' --lease seconds]
   heartbeat --agent A
   leave --agent A [--force --authority human --reason "..."]
   agents
 
+Parallel lanes:
+  assign <id> --agent A --to B --aspect "storage layer"
+         --files path,path --reviewers C[,D] [--needs id,id]
+  unassign <id> --agent A --reason "..."
+  next --agent A
+
 Work lifecycle:
-  status
-  claim <id> --agent A --branch B --files path,path --reviewers B,C
+  status [--agent A]
+  claim <id> --agent A --branch B [--files path,path --reviewers B,C]
   amend <id> --agent A --files path,path
   reviewers <id> --agent A --set B,C --reason "..."
   check <id> --agent A
@@ -229,8 +290,15 @@ Messaging:
   read --agent A [--wait --timeout seconds --count N]
   log [--limit N]
 
-Recovery:
+Policy and recovery:
+  policy --agent <configured-integrator> --reason "..."
+         [--base-advance strict|disjoint --review-debt-limit seconds]
   unlock --authority human --reason "verified stale local lock"
+
+next is the one command to run when you do not know what to do: it ranks a
+partner's blocked work above your own. claim inherits --files and --reviewers
+from an assigned lane. Under --base-advance disjoint a ready round survives a
+base advance git proves touched none of its declared files.
 
 Redis is opt-in. Set the configured URL environment variable and run npm install
 inside the skill directory. Agent identities remain self-asserted on both backends.`);
@@ -261,15 +329,29 @@ async function main() {
     const streamMaxLength = integerFlag(flags["stream-max-length"] || 10_000, "stream-max-length", 100, 1_000_000);
     const redisUrlEnv = String(flags["redis-url-env"] || "COORD_REDIS_URL");
     if (!/^[A-Z_][A-Z0-9_]{1,63}$/.test(redisUrlEnv)) fail("redis-url-env must be an uppercase environment variable name");
-    const config = { version: 2, backend, project, base, integrator, shared, ...(queue ? { queue } : {}), reviewQuorum, defaultLeaseSeconds, streamMaxLength, redisUrlEnv };
+    const baseAdvance = String(flags["base-advance"] || "strict");
+    if (!["strict", "disjoint"].includes(baseAdvance)) fail("base-advance must be strict or disjoint");
+    const reviewDebtLimit = flags["review-debt-limit"] === undefined ? 0 : integerFlag(flags["review-debt-limit"], "review-debt-limit", 0, 86_400);
+    const config = { version: 2, backend, project, base, integrator, shared, ...(queue ? { queue } : {}), reviewQuorum, defaultLeaseSeconds, streamMaxLength, redisUrlEnv, baseAdvance, reviewDebtLimit };
     mkdirSync(coordinationDirectory, { recursive: true });
     activeStore = await createStore(config);
     const initialized = await activeStore.initialize(initialState(configPolicy(config)));
     if (existsSync(configPath)) {
+      // initialize() has already refused any policy that disagrees with the
+      // board, so remaining drift in the two adjustable keys means this local
+      // file predates them or predates a recorded policy change. Refresh it.
       const existing = readJson(configPath);
-      if (JSON.stringify(existing) !== JSON.stringify(config)) fail(`Local config already exists and differs at ${configPath}`);
+      const adjustable = new Set(["baseAdvance", "reviewDebtLimit"]);
+      const drift = [...new Set([...Object.keys(existing), ...Object.keys(config)])]
+        .filter((key) => JSON.stringify(existing[key]) !== JSON.stringify(config[key]));
+      if (drift.some((key) => !adjustable.has(key))) fail(`Local config already exists and differs at ${configPath}`);
+      if (drift.length) {
+        writeJsonAtomically(configPath, config);
+        console.log(`Refreshed local config to match the board: ${drift.join(", ")}`);
+      }
     } else writeJsonAtomically(configPath, config);
     console.log(`${initialized.created ? "Initialized" : "Attached to"} ${backend} coordination for ${project}; base ${base}; integrator ${integrator}; review quorum ${reviewQuorum}`);
+    console.log(`base advance ${baseAdvance}; peer debt limit ${reviewDebtLimit ? formatAge(reviewDebtLimit * 1000) : "advisory only"}`);
     console.log("Agent identities are self-asserted; the event log is an audit aid, not authentication.");
     return;
   }
@@ -280,6 +362,17 @@ async function main() {
   if (command === "unlock") {
     await activeStore.unlock({ authority: flags.authority, reason: flags.reason });
     console.log("Removed local mutation.lock with a logged human override");
+    return;
+  }
+
+  if (command === "policy") {
+    const agent = validateAgent(String(flags.agent || ""));
+    const baseAdvance = flags["base-advance"] === undefined ? null : String(flags["base-advance"]);
+    const reviewDebtLimit = flags["review-debt-limit"] === undefined ? null : integerFlag(flags["review-debt-limit"], "review-debt-limit", 0, 86_400);
+    if (baseAdvance === null && reviewDebtLimit === null) fail("policy needs --base-advance and/or --review-debt-limit");
+    const change = await activeStore.mutate((state) => setPolicy(state, { agent, baseAdvance, reviewDebtLimit, reason: flags.reason }));
+    writeJsonAtomically(configPath, { ...config, ...change.after });
+    console.log(`policy: base advance ${change.after.baseAdvance}; peer debt limit ${change.after.reviewDebtLimit ? formatAge(change.after.reviewDebtLimit * 1000) : "advisory only"}`);
     return;
   }
 
@@ -323,15 +416,98 @@ async function main() {
 
   if (command === "status") {
     const state = await activeStore.readState();
-    console.log(`project: ${config.project}  backend: ${config.backend}  base: ${config.base}  integrator: ${config.integrator}  quorum: ${config.reviewQuorum}`);
-    console.log("item                 state      owner          branch                          review");
+    const assignments = state.assignments || {};
+    console.log(`project: ${config.project}  backend: ${config.backend}  base: ${config.base}  integrator: ${config.integrator}  quorum: ${config.reviewQuorum}  base-advance: ${config.baseAdvance || "strict"}`);
+    console.log("item               state     owner        aspect                 branch                   review");
     for (const [id, claim] of Object.entries(state.claims).sort(([left], [right]) => left.localeCompare(right))) {
       const summary = approvalSummary(claim);
       const note = claim.openQuestion ? `waiting on ${claim.waitingOn}` : claim.ready ? `${summary.approved.length}/${claim.quorum} approved` : "";
-      console.log(`${id.padEnd(20)} ${claim.state.padEnd(10)} ${claim.agent.padEnd(14)} ${(claim.branch || "-").padEnd(31)} ${note}`);
+      console.log(`${id.padEnd(18)} ${claim.state.padEnd(9)} ${claim.agent.padEnd(12)} ${(claim.aspect || "-").slice(0, 22).padEnd(22)} ${(claim.branch || "-").slice(0, 24).padEnd(24)} ${note}`);
     }
+    const lanes = Object.entries(assignments).sort(([left], [right]) => left.localeCompare(right));
+    if (lanes.length) {
+      console.log("lane               assignee     aspect                 files  reviewers            blocked by");
+      for (const [id, lane] of lanes) {
+        const blocked = unmetDependencies(state, lane.needs, "claim");
+        console.log(`${id.padEnd(18)} ${lane.assignee.padEnd(12)} ${lane.aspect.slice(0, 22).padEnd(22)} ${String(lane.files.length).padEnd(6)} ${lane.reviewers.join(",").slice(0, 20).padEnd(20)} ${blocked.join(", ") || "-"}`);
+      }
+    }
+    const active = Object.values(state.claims).filter((claim) => ["claimed", "ready"].includes(claim.state));
+    const startable = lanes.filter(([, lane]) => !unmetDependencies(state, lane.needs, "claim").length).length;
+    const owners = new Set(active.map((claim) => claim.agent));
+    console.log(`in flight: ${active.length} claim${active.length === 1 ? "" : "s"} across ${owners.size} agent${owners.size === 1 ? "" : "s"}; lanes: ${lanes.length} open, ${startable} startable now`);
     const presence = liveAgents(state);
     console.log(`agents: ${presence.map((item) => `${item.agent}:${item.presence}`).join("  ") || "none"}`);
+    return;
+  }
+
+  if (command === "assign") {
+    const id = validateId(target);
+    const agent = validateAgent(String(flags.agent || ""));
+    const to = validateAgent(String(flags.to || ""));
+    const requested = [...new Set(commaList(flags.files, normalizeProjectPath))].sort();
+    if (!requested.length) fail("A lane needs --files: the exclusive paths that make it parallel");
+    const tooBroad = requested.find((path) => (config.shared || []).some((sharedPath) => sharedPath.startsWith(`${path}/`)));
+    if (tooBroad) fail(`${tooBroad} contains a configured shared path; assign narrower paths`);
+    const files = requested.filter((path) => !pathCovered(path, config.shared || []));
+    if (!files.length) fail("Every requested path is a configured shared path, which is never exclusive; a lane needs at least one owned path");
+    const lane = await activeStore.mutate((state) => assignTask(state, {
+      id,
+      agent,
+      to,
+      aspect: flags.aspect,
+      files,
+      reviewers: commaList(flags.reviewers, validateAgent),
+      needs: commaList(flags.needs, validateId),
+    }));
+    console.log(`${id} assigned to ${to} (${lane.aspect}); ${lane.files.length} exclusive path${lane.files.length === 1 ? "" : "s"}; reviewers ${lane.reviewers.join(", ")}${lane.needs.length ? `; after ${lane.needs.join(", ")}` : ""}`);
+    return;
+  }
+
+  if (command === "unassign") {
+    const id = validateId(target);
+    const agent = validateAgent(String(flags.agent || ""));
+    const lane = await activeStore.mutate((state) => unassignTask(state, { id, agent, reason: flags.reason }));
+    console.log(`${id} withdrawn from ${lane.assignee}; its paths are free to reassign`);
+    return;
+  }
+
+  if (command === "next") {
+    const agent = validateAgent(String(flags.agent || ""));
+    const state = await activeStore.readState();
+    if (!state.agents[agent]) fail(`${agent} has not joined this project`);
+    await activeStore.mutate((draft) => heartbeatAgent(draft, { agent }));
+    const list = worklist(state, agent);
+    const run = invocation();
+    const startable = list.lanes.filter((lane) => !lane.blockedBy.length).length;
+    console.log(`${agent}: ${list.obligations.length} blocking a partner, ${list.own.length} own, ${startable} lane${startable === 1 ? "" : "s"} to start`);
+    for (const item of list.obligations) {
+      if (item.kind === "question") {
+        console.log(`BLOCKING  answer ${item.id} for ${item.owner}, waiting ${formatAge(item.waitingMs)}: ${item.question}`);
+        console.log(`          ${run} answer ${item.id} --agent ${agent} --text "decision and rationale"`);
+      } else if (item.kind === "review") {
+        console.log(`BLOCKING  review ${item.id} for ${item.owner} at ${item.head.slice(0, 12)}, waiting ${formatAge(item.waitingMs)}`);
+        console.log(`          ${run} review ${item.id} --agent ${agent} --verdict approve|changes --evidence "file:line and what you ran"`);
+      } else {
+        console.log(`BLOCKING  gate ${item.id} for ${item.owner}, quorum met ${formatAge(item.waitingMs)} ago`);
+        console.log(`          ${run} gate ${item.id} --agent ${agent}`);
+      }
+    }
+    for (const item of list.own) {
+      console.log(`YOURS     ${item.id}${item.aspect ? ` (${item.aspect})` : ""} ${item.state} — ${item.detail}`);
+      if (item.action === "implement") console.log(`          ${run} check ${item.id} --agent ${agent}, then ${run} ready ${item.id} --agent ${agent} --evidence "..."`);
+    }
+    for (const item of list.lanes) {
+      if (item.blockedBy.length) {
+        console.log(`LANE      ${item.id} (${item.aspect}) blocked by ${item.blockedBy.join(", ")}`);
+        continue;
+      }
+      console.log(`LANE      ${item.id} (${item.aspect}) ${item.files.length} path${item.files.length === 1 ? "" : "s"}, reviewers ${item.reviewers.join(", ")} — yours to start`);
+      console.log(`          ${run} claim ${item.id} --agent ${agent} --branch <feature-branch>`);
+    }
+    if (!list.obligations.length && !list.own.length && !list.lanes.length) {
+      console.log(`IDLE      nothing assigned to you; ask ${config.integrator} for a lane, or wait: ${run} read --agent ${agent} --wait --timeout 60`);
+    }
     return;
   }
 
@@ -340,16 +516,18 @@ async function main() {
     const agent = validateAgent(String(flags.agent || ""));
     const branch = String(flags.branch || "").trim();
     if (!branch || !branchHead(branch)) fail(`Claim branch must already exist locally: ${branch || "<empty>"}`);
-    const declared = [...new Set(commaList(flags.files, normalizeProjectPath))].sort();
+    const lane = (await activeStore.readState()).assignments?.[id] || null;
+    const requested = flags.files === undefined && lane ? lane.files.join(",") : flags.files;
+    const declared = [...new Set(commaList(requested, normalizeProjectPath))].sort();
     if (!declared.length) fail("Declare at least one file or directory with --files");
     const tooBroad = declared.find((path) => (config.shared || []).some((sharedPath) => sharedPath.startsWith(`${path}/`)));
     if (tooBroad) fail(`${tooBroad} contains a configured shared path; claim narrower paths`);
     const shared = declared.filter((path) => pathCovered(path, config.shared || []));
     const files = declared.filter((path) => !shared.includes(path));
-    const reviewers = commaList(flags.reviewers, validateAgent);
+    const reviewers = flags.reviewers === undefined && lane ? [...lane.reviewers] : commaList(flags.reviewers, validateAgent);
     const claim = await activeStore.mutate((state) => claimTask(state, { id, agent, branch, files, reviewers }));
     if (shared.length) console.log(`Not locking configured shared path${shared.length === 1 ? "" : "s"}: ${shared.join(", ")}`);
-    console.log(`${agent} holds ${id}; reviewers ${claim.reviewers.join(", ")} (${claim.quorum} required)`);
+    console.log(`${agent} holds ${id}${claim.aspect ? ` (${claim.aspect})` : ""}; reviewers ${claim.reviewers.join(", ")} (${claim.quorum} required)`);
     return;
   }
 
@@ -447,7 +625,9 @@ async function main() {
     if (!workingTreeClean()) fail("Review from a clean worktree");
     const head = runGit(root, ["rev-parse", "HEAD"]);
     const baseHead = runGit(root, ["rev-parse", config.base]);
-    const result = await activeStore.mutate((state) => reviewClaim(state, { id, agent, verdict: String(flags.verdict || ""), evidence: flags.evidence, head, baseHead }));
+    const advance = baseAdvanceProof((await activeStore.readState()).claims[id], baseHead);
+    const result = await activeStore.mutate((state) => reviewClaim(state, { id, agent, verdict: String(flags.verdict || ""), evidence: flags.evidence, head, baseHead, baseAdvance: advance }));
+    if (advance) console.log(`${config.base} advanced ${advance.from.slice(0, 12)}..${baseHead.slice(0, 12)} over ${advance.changed} file${advance.changed === 1 ? "" : "s"}, none in this claim's scope; round kept`);
     console.log(`${flags.verdict} recorded for ${id}; approvals ${result.summary.approved.length}/${result.claim.quorum}`);
     return;
   }
@@ -464,7 +644,11 @@ async function main() {
     const summary = approvalSummary(claim);
     if (!summary.satisfied) fail(`${id} has ${summary.approved.length}/${claim.quorum} required approvals`);
     if (branchHead(claim.branch) !== claim.ready.head) fail(`${claim.branch} changed after review; repeat ready and review`);
-    if (runGit(root, ["rev-parse", config.base]) !== claim.ready.baseHead) fail(`${config.base} moved after readiness; synchronize and repeat review`);
+    const currentBase = runGit(root, ["rev-parse", config.base]);
+    const advance = baseAdvanceProof(claim, currentBase);
+    const blocked = baseAdvanceBlocks(state, claim, currentBase, advance);
+    if (blocked) fail(blocked);
+    if (advance) console.log(`${config.base} advanced ${advance.from.slice(0, 12)}..${currentBase.slice(0, 12)} over ${advance.changed} file${advance.changed === 1 ? "" : "s"}, none in this claim's scope`);
     console.log(`GATE PASS ${id}: integrator ${agent} may merge ${claim.ready.head} into ${config.base}`);
     return;
   }
@@ -572,6 +756,7 @@ async function main() {
 
 try {
   await main();
+  await printBlockedOnYou();
 } catch (error) {
   if (error instanceof CoordError) {
     console.error(error.message);
